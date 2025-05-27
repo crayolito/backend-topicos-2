@@ -13,13 +13,13 @@ class AnalizadorContexto:
         self.db_config = {
             'host': 'localhost',
             'user': 'root',          # Cambia esto por tu usuario de MySQL
-            'password': 'clave123',          # Cambia esto por tu contraseña de MySQL
+            'password': 'clave123',  # Cambia esto por tu contraseña de MySQL
             'database': 'bot_productos_db',
             'charset': 'utf8mb4'
         }
         
-        # Clave API de OpenAI (la misma que usabas antes)
-        self.api_key = "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"
+        # Clave API de OpenAI
+        self.api_key = ""
         
         # Verificar conexión inicial
         self.verificar_conexion()
@@ -41,7 +41,7 @@ class AnalizadorContexto:
     def obtener_datos_base(self):
         """
         Obtiene todos los datos relevantes de la base de datos
-        para usar como contexto en el análisis
+        Solo información necesaria para venta: productos, precios, stock, sucursales
         """
         try:
             # Establecer conexión
@@ -50,13 +50,15 @@ class AnalizadorContexto:
             
             datos_contexto = {}
             
-            # Obtener productos con sus precios
+            # Obtener productos con sus precios (solo productos activos)
             cursor.execute("""
-                SELECT p.id_producto, p.nombre, p.descripcion, p.codigo, p.stock_global,
+                SELECT p.id_producto, p.nombre, p.descripcion, p.codigo, 
+                       p.stock_global, p.precio_base,
                        lp.nombre_lista, plp.precio
                 FROM producto p
                 LEFT JOIN productolistaprecio plp ON p.id_producto = plp.id_producto
-                LEFT JOIN listaprecio lp ON plp.id_lista = lp.id_lista
+                LEFT JOIN listaprecio lp ON plp.id_lista = lp.id_lista AND lp.activo = TRUE
+                WHERE p.activo = TRUE
                 ORDER BY p.nombre, lp.nombre_lista
             """)
             productos_raw = cursor.fetchall()
@@ -70,21 +72,24 @@ class AnalizadorContexto:
                         'id': row['id_producto'],
                         'descripcion': row['descripcion'],
                         'codigo': row['codigo'],
-                        'stock': row['stock_global'],
+                        'stock_global': row['stock_global'],
+                        'precio_base': float(row['precio_base']) if row['precio_base'] else 0,
                         'precios': {}
                     }
                 
+                # Agregar precios de listas específicas si existen
                 if row['nombre_lista'] and row['precio']:
                     productos[nombre]['precios'][row['nombre_lista']] = float(row['precio'])
             
             datos_contexto['productos'] = productos
             
-            # Obtener sucursales y almacenes
+            # Obtener sucursales activas con sus almacenes
             cursor.execute("""
                 SELECT s.id_sucursal, s.nombre as sucursal_nombre, s.direccion,
                        a.id_almacen, a.nombre as almacen_nombre
                 FROM sucursal s
-                LEFT JOIN almacen a ON s.id_sucursal = a.id_sucursal
+                LEFT JOIN almacen a ON s.id_sucursal = a.id_sucursal AND a.activo = TRUE
+                WHERE s.activo = TRUE
                 ORDER BY s.nombre, a.nombre
             """)
             sucursales_raw = cursor.fetchall()
@@ -103,7 +108,7 @@ class AnalizadorContexto:
             
             datos_contexto['sucursales'] = sucursales
             
-            # Obtener información de stock por almacén
+            # Obtener información de stock por almacén (solo cantidades positivas)
             cursor.execute("""
                 SELECT p.nombre as producto_nombre, a.nombre as almacen_nombre, 
                        sa.cantidad, s.nombre as sucursal_nombre
@@ -111,21 +116,11 @@ class AnalizadorContexto:
                 JOIN producto p ON sa.id_producto = p.id_producto
                 JOIN almacen a ON sa.id_almacen = a.id_almacen
                 JOIN sucursal s ON a.id_sucursal = s.id_sucursal
-                WHERE sa.cantidad > 0
+                WHERE sa.cantidad > 0 AND p.activo = TRUE AND a.activo = TRUE AND s.activo = TRUE
                 ORDER BY p.nombre, s.nombre
             """)
             stock_info = cursor.fetchall()
             datos_contexto['stock_por_ubicacion'] = stock_info
-            
-            # Obtener clientes recientes (para referencia)
-            cursor.execute("""
-                SELECT nombre, email, fecha_registro
-                FROM cliente
-                ORDER BY fecha_registro DESC
-                LIMIT 10
-            """)
-            clientes_recientes = cursor.fetchall()
-            datos_contexto['clientes_recientes'] = len(clientes_recientes)
             
             conexion.close()
             return datos_contexto
@@ -139,7 +134,6 @@ class AnalizadorContexto:
         Procesa la consulta usando la API de OpenAI
         """
         try:
-            # Configuración para la API de OpenAI
             endpoint = 'https://api.openai.com/v1/chat/completions'
             headers = {
                 'Content-Type': 'application/json',
@@ -147,43 +141,40 @@ class AnalizadorContexto:
             }
             
             payload = {
-                'model': 'gpt-4o-mini',  # Modelo más económico pero efectivo
+                'model': 'gpt-4o-mini',
                 'messages': [
                     {
                         'role': 'system',
-                        'content': 'Eres un asistente especializado en productos tecnológicos. Responde de manera clara y concisa.'
+                        'content': 'Eres un vendedor experto en productos tecnológicos. Responde como un consultor de tienda profesional, amable y servicial. Solo brinda información sobre productos, precios, stock y disponibilidad.'
                     },
                     {
                         'role': 'user',
                         'content': prompt
                     }
                 ],
-                'temperature': 0.3,  # Respuestas más consistentes
-                'max_tokens': 500    # Respuestas concisas
+                'temperature': 0.3,
+                'max_tokens': 400
             }
             
-            # Realizar la petición HTTP
             response = requests.post(endpoint, headers=headers, json=payload, timeout=30)
             
-            # Verificar si la respuesta es exitosa
             if response.status_code != 200:
                 error_data = response.json() if response.text else {}
                 error_msg = error_data.get('error', {}).get('message', 'Error desconocido')
-                return f"Error en API: {error_msg}"
+                return f"Disculpa, tengo problemas técnicos. Intenta de nuevo."
             
-            # Procesar la respuesta
             data = response.json()
             return data['choices'][0]['message']['content']
             
         except requests.Timeout:
             return "La consulta tardó demasiado en procesarse. Intenta de nuevo."
         except Exception as e:
-            return f"Error al procesar con OpenAI: {str(e)}"
+            return f"Error al procesar la consulta: {str(e)}"
 
     def analizar_pregunta(self, pregunta):
         """
         Función principal que analiza si la pregunta está en contexto
-        y genera una respuesta apropiada
+        y genera una respuesta como vendedor de tienda
         """
         try:
             # Obtener todos los datos de la base de datos
@@ -192,62 +183,62 @@ class AnalizadorContexto:
             if not datos_contexto:
                 return {
                     'fuera_de_contexto': True,
-                    'respuesta': 'No pude acceder a la información de productos en este momento.'
+                    'respuesta': 'No pude acceder a la información de productos en este momento. Por favor, intenta más tarde.'
                 }
             
-            # Crear el contexto para el prompt
+            # Crear el contexto de productos para el vendedor
             contexto_productos = []
             for nombre, info in datos_contexto['productos'].items():
-                precios_texto = ""
+                # Precio principal (base o de lista)
+                precio_principal = info['precio_base']
+                precios_adicionales = ""
+                
                 if info['precios']:
                     precios_lista = [f"{lista}: {precio} Bs" for lista, precio in info['precios'].items()]
-                    precios_texto = f" - Precios: {', '.join(precios_lista)}"
+                    precios_adicionales = f" | Listas especiales: {', '.join(precios_lista)}"
+                
+                disponibilidad = "Disponible" if info['stock_global'] > 0 else "Sin stock"
                 
                 contexto_productos.append(
-                    f"- {nombre}: {info['descripcion']} (Stock: {info['stock']}){precios_texto}"
+                    f"- {nombre}: {info['descripcion']} | Precio: {precio_principal} Bs{precios_adicionales} | Stock: {info['stock_global']} unidades ({disponibilidad})"
                 )
             
+            # Información de sucursales para delivery/retiro
             contexto_sucursales = []
             for nombre, info in datos_contexto['sucursales'].items():
-                almacenes = ', '.join(info['almacenes']) if info['almacenes'] else 'Sin almacenes'
+                almacenes = ', '.join(info['almacenes']) if info['almacenes'] else 'Consultar disponibilidad'
                 contexto_sucursales.append(
-                    f"- {nombre} ({info['direccion']}): {almacenes}"
+                    f"- {nombre}: {info['direccion']} | Almacenes: {almacenes}"
                 )
             
-            # Construir el prompt para OpenAI
+            # Crear prompt para el vendedor
             prompt = f"""
-INFORMACIÓN DE LA TIENDA DE PRODUCTOS TECNOLÓGICOS:
-
-PRODUCTOS DISPONIBLES:
+ERES UN VENDEDOR EXPERTO DE TIENDA DE TECNOLOGÍA
+INFORMACIÓN DE PRODUCTOS DISPONIBLES:
 {chr(10).join(contexto_productos)}
 
-SUCURSALES:
+SUCURSALES PARA RETIRO/DELIVERY:
 {chr(10).join(contexto_sucursales)}
 
-CLIENTES REGISTRADOS: {datos_contexto.get('clientes_recientes', 0)} clientes recientes
+CONSULTA DEL CLIENTE: "{pregunta}"
 
-INSTRUCCIONES:
-1. La pregunta del usuario es: "{pregunta}"
-2. Si la pregunta se relaciona con productos, precios, stock, sucursales, disponibilidad o cualquier información de la tienda, responde de manera útil y concisa.
-3. Si la pregunta NO se relaciona con productos tecnológicos, ventas, stock, precios o información de la tienda, responde EXACTAMENTE: "No tengo información sobre eso. Alguna otra consulta relacionada a los productos?"
-4. Mantén las respuestas breves pero informativas (máximo 3-4 líneas).
-5. Si preguntan por un producto específico, incluye precio y disponibilidad si los tienes.
-6. Si preguntan por categorías generales (ej: "laptops", "teclados"), menciona las opciones disponibles.
+INSTRUCCIONES IMPORTANTES:
+1. Si la pregunta se relaciona con productos, precios, stock, disponibilidad, sucursales, especificaciones técnicas, comparaciones de productos, o consultas de compra - RESPONDE como un vendedor profesional
+2. Si la pregunta NO tiene relación con productos tecnológicos, ventas, tienda o comercio - RESPONDE EXACTAMENTE: "No tengo información sobre eso. ¿Te puedo ayudar con algún producto?"
+3. Actúa como vendedor: menciona beneficios, ayuda a decidir, sugiere productos similares si no hay stock
+4. Incluye precios y disponibilidad cuando sea relevante
+5. Mantén respuestas concisas pero útiles (máximo 4 líneas)
+6. Si preguntan por categorías, menciona productos disponibles de esa categoría
 
-RESPUESTA:
+RESPUESTA DEL VENDEDOR:
 """
             
             # Procesar con OpenAI
             respuesta_ai = self.procesar_con_openai(prompt)
             
             # Verificar si está fuera de contexto
-            fuera_contexto_phrases = [
-                "Si se sale fuera de lo que hay en mi base de datos",
-                "no tiene esa información",
-                "fuera del contexto"
-            ]
-            
-            es_fuera_contexto = any(phrase in respuesta_ai for phrase in fuera_contexto_phrases)
+            frase_fuera_contexto = "No tengo información sobre eso. ¿Te puedo ayudar con algún producto?"
+            es_fuera_contexto = frase_fuera_contexto in respuesta_ai
             
             return {
                 'fuera_de_contexto': es_fuera_contexto,
@@ -258,5 +249,5 @@ RESPUESTA:
             print(f"Error en analizar_pregunta: {e}")
             return {
                 'fuera_de_contexto': True,
-                'respuesta': 'Error interno al procesar la consulta.'
+                'respuesta': 'Error interno al procesar la consulta. Por favor, intenta nuevamente.'
             }
